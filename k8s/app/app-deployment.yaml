@@ -1,0 +1,195 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: telemetry-demo-app
+  labels:
+    app: telemetry-demo-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: telemetry-demo-app
+  template:
+    metadata:
+      labels:
+        app: telemetry-demo-app
+    spec:
+      containers:
+      # Main application container
+      - name: app
+        image: thatc0olguy/telemetry-demo-app:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 3000
+          name: http
+        env:
+        - name: NODE_ENV
+          value: "production"
+        # Point to the sidecar collector
+        - name: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
+          value: "http://localhost:4318/v1/traces"
+        - name: OTEL_EXPORTER_OTLP_METRICS_ENDPOINT
+          value: "http://localhost:4318/v1/metrics"
+        - name: LOKI_URL
+          value: "http://loki:3100"
+        - name: PROMETHEUS_URL
+          value: "http://prometheus:9090"
+        - name: TEMPO_URL
+          value: "http://tempo:3200"
+        - name: OTEL_SERVICE_NAME
+          value: "telemetry-demo-app"
+        - name: OTEL_SERVICE_VERSION
+          value: "1.0.0"
+        - name: OTEL_RESOURCE_ATTRIBUTES
+          value: "service.name=telemetry-demo-app,service.version=1.0.0,deployment.environment=production"
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 3000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 3000
+          initialDelaySeconds: 15
+          periodSeconds: 5
+        volumeMounts:
+        - name: collector-config
+          mountPath: /etc/otelcol
+      
+      # Sidecar OpenTelemetry collector container
+      - name: collector
+        image: otel/opentelemetry-collector-contrib:latest
+        command:
+        - "/otelcol-contrib"
+        - "--config=/etc/otelcol/config.yaml"
+        ports:
+        - containerPort: 4317
+          name: otlp-grpc
+        - containerPort: 4318
+          name: otlp-http
+        - containerPort: 8889
+          name: prometheus
+        volumeMounts:
+        - name: collector-config
+          mountPath: /etc/otelcol
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "200m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        startupProbe:
+          httpGet:
+            path: /
+            port: 13133
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 30
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 13133
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 13133
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 3
+      volumes:
+      - name: collector-config
+        configMap:
+          name: collector-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: telemetry-demo-app
+  labels:
+    app: telemetry-demo-app
+spec:
+  selector:
+    app: telemetry-demo-app
+  ports:
+  - port: 80
+    targetPort: 3000
+    protocol: TCP
+    name: http
+  - port: 8889
+    targetPort: 8889
+    protocol: TCP
+    name: metrics
+  type: LoadBalancer
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: collector-config
+data:
+  config.yaml: |
+    extensions:
+      health_check:
+        endpoint: 0.0.0.0:13133
+    
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+    
+    processors:
+      batch:
+        timeout: 1s
+        send_batch_size: 1024
+      memory_limiter:
+        limit_mib: 400
+        check_interval: 1s
+
+    
+    exporters:
+      # Export traces to Tempo
+      otlp/tempo:
+        endpoint: http://tempo:4317
+        tls:
+          insecure: true
+      
+      # Export metrics to Prometheus
+      prometheus:
+        endpoint: "0.0.0.0:8889"
+        const_labels:
+          service: telemetry-demo-app
+      
+      # Debug logging
+      debug:
+        verbosity: normal
+    
+    service:
+      extensions: [health_check]
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [memory_limiter, batch]
+          exporters: [otlp/tempo, debug]
+        
+        metrics:
+          receivers: [otlp]
+          processors: [memory_limiter, batch]
+          exporters: [prometheus, debug] 
